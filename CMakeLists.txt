@@ -4,9 +4,8 @@
 # `strata-pack` are added when their sources exist - a target with no sources would make the build graph
 # claim something the tree does not have, which is worse than an absent target.
 #
-# CUDA targets arrive in Phase 2 and this build REJECTS any architecture other than 120: the engine is
-# written against sm_120 (RTX 5000 / Blackwell) and silently building for an older arch would produce a
-# binary that runs and is wrong about its own performance, which is the worst of both outcomes.
+# CUDA targets arrive in Phase 2. sm_80+ keeps the tuned matrix paths; sm_70 uses Volta-safe FP32 fallbacks
+# for the QSA scorer and BF16 prefill GEMM.
 cmake_minimum_required(VERSION 3.24)
 project(strata VERSION 0.1.0 LANGUAGES CXX)
 
@@ -44,14 +43,13 @@ if(STRATA_ENABLE_CUDA)
   endif()
   foreach(_a IN LISTS CMAKE_CUDA_ARCHITECTURES)
     string(REGEX REPLACE "-.*$" "" _base "${_a}")     # 120-real / 120-virtual are still 120
-    # Plan v0.3 P6: developed and measured on sm_120 (RTX 50); the kernels need sm_80 or newer (tf32 mma in
-    # the attention scorer, bf16 math), so RTX 30 (86) and RTX 40 (89) build too.  Older cards are refused.
+    # The Ampere QSA scorer and BF16 cuBLAS path are kept on sm_80+. Volta has explicit FP32 fallbacks.
     if(_base STREQUAL "native" OR _base STREQUAL "all" OR _base STREQUAL "all-major")
       continue()
     endif()
-    if(_base LESS 80)
+    if(_base LESS 70)
       message(FATAL_ERROR
-        "Strata needs an NVIDIA GPU of compute capability 8.0 or newer (RTX 30 / 40 / 50 series), but "
+        "Strata needs an NVIDIA GPU of compute capability 7.0 or newer (Volta or newer), but "
         "CMAKE_CUDA_ARCHITECTURES is '${CMAKE_CUDA_ARCHITECTURES}'.")
     endif()
   endforeach()
@@ -105,8 +103,8 @@ add_executable(strata-plan src/plan/plan_main.cpp)
 target_link_libraries(strata-plan PRIVATE strata_plan)
 
 # ---- strata_core (CUDA, Phase 2) ------------------------------------------
-# Only built when CUDA is on, so the Phase 1 targets keep working on a machine with no toolkit.  The arch
-# guard above has already refused anything but sm_120 by the time this runs.
+# Only built when CUDA is on, so the Phase 1 targets keep working on a machine with no toolkit. The arch
+# guard above accepts sm_70+; architecture-specific paths dispatch to the compatible implementation.
 if(STRATA_ENABLE_CUDA)
   add_library(strata_core STATIC src/core/device.cu src/core/pinned.cu src/platform/memory.cpp src/core/graph.cpp src/core/weights.cpp
                                src/core/layout.cpp)
@@ -251,6 +249,11 @@ if(STRATA_ENABLE_CUDA)
   target_include_directories(strata_prefill PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
   target_link_libraries(strata_prefill PUBLIC strata_engine CUDA::cublas CUDA::cudart)
 
+  add_executable(bf16_gemm_parity src/prefill/gemm_parity.cpp)
+  target_include_directories(bf16_gemm_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+  target_link_libraries(bf16_gemm_parity PRIVATE strata_prefill CUDA::cudart)
+  add_test(NAME bf16_gemm_parity COMMAND bf16_gemm_parity --selftest)
+
   add_executable(strata src/program/generate.cpp)
   target_include_directories(strata PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
   target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec CUDA::cudart)
@@ -335,6 +338,11 @@ if(STRATA_ENABLE_CUDA)
   target_include_directories(qsa_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
   target_link_libraries(qsa_parity PRIVATE strata_kernels CUDA::cudart)
   add_test(NAME qsa_parity COMMAND qsa_parity --selftest)
+
+  add_executable(native_qsa_score_parity src/kernels/native_qsa_score_parity.cpp)
+  target_include_directories(native_qsa_score_parity PRIVATE ${CMAKE_CUDA_TOOLKIT_INCLUDE_DIRECTORIES})
+  target_link_libraries(native_qsa_score_parity PRIVATE strata_kernels CUDA::cudart)
+  add_test(NAME native_qsa_score_parity COMMAND native_qsa_score_parity --selftest)
 
   # ---- P2.S4: the PLE n-gram hash, the IQ4_NL table read, and the PLE block ----
   # `ngram.cpp` is host-only but lives in `strata_kernels` because `ple.cu` shares its geometry constants, and

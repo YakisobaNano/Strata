@@ -65,10 +65,14 @@ Not sure? Take **IQ2_XS**. You can add another one later with `START-HERE.bat --
 
 ## Install
 
-**You need:** an NVIDIA RTX 30, 40 or 50 card with 12 GB of VRAM or more, enough RAM for the size you pick (above),
+**You need:** an NVIDIA RTX 30, 40 or 50 card with 12 GB of VRAM or more, or a Tesla V100 with a source build
+(CUDA 12.x, sm_70; the Volta FP32 fallback is slower), enough RAM for the size you pick (above),
 ~80 GB of free disk space (an SSD makes the first start much faster), and Windows 10/11 or Linux. The only thing you
 install yourself is a current **NVIDIA driver** ([nvidia.com/drivers](https://www.nvidia.com/drivers) or the NVIDIA
 App). Everything else - Python, the engine, the model - is set up for you.
+
+**CPU note:** the Q2_0 expert kernel needs AVX-512 VNNI and VBMI. On an AVX2-only CPU such as the Core i7-7700,
+choose IQ2_XS; its native expert path supports AVX2.
 
 **Windows**
 

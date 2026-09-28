@@ -13,8 +13,8 @@ What the first run does (each step is skipped when it is already done):
   1. checks your PC: NVIDIA GPU and driver, RAM, CPU, free disk space
   2. asks the questions
   3. installs the Python packages it needs into .venv (numpy, jinja2, ..., and NVIDIA's CUDA libraries)
-  4. gets the Strata engine: a ready-made build for RTX 30/40/50 cards (no compiler needed); if none fits your PC,
-     it installs the build tools (asks first) and compiles the engine for your GPU
+  4. gets the Strata engine: a ready-made build for RTX 30/40/50 cards (no compiler needed); for Volta and other
+     cards without a matching release, it compiles the engine for your GPU
   5. downloads the model from Hugging Face (resumable), and the vision encoder if you want images
   6. prepares the model for Strata and fetches the MTP draft layer (~5 GB, from the original Qwen checkpoint)
   7. writes run-<model>.bat / run-<model>.sh and starts the model
@@ -417,6 +417,9 @@ def get_prebuilt(url_base, gpu, vision) -> Path | None:
             return eng
         say(f"  Updating the ready-made engine ({meta.get('version')} -> {'.'.join(map(str, MIN_ENGINE))} or newer) ...")
         info.unlink()
+    # The published binary targets newer Tensor Core paths. Volta must use the locally compiled FP32 fallbacks.
+    if int(gpu["arch"]) < 80:
+        return None
     if not url_base:
         return None
     z = ROOT / "engine" / PREBUILT_ASSET
@@ -519,13 +522,14 @@ def install_build_tools(gpu, yes):
     """The compiler and the CUDA toolkit, installed for the user (asks once).  Returns (nvcc, vcvars)."""
     nvcc, cuda_v = find_nvcc()
     need_cuda = (12, 8) if int(gpu["arch"]) >= 120 else (12, 0)
+    need_cuda_text = f"CUDA Toolkit {need_cuda[0]}.{need_cuda[1]} or newer"
     vcvars = find_vcvars() if WIN else None
     have_cc = vcvars is not None if WIN else shutil.which("g++") is not None
     missing = []
     if not have_cc:
         missing.append("Visual Studio 2022 Build Tools (C++)" if WIN else "the C++ compiler (build-essential)")
     if nvcc is None or cuda_v < need_cuda:
-        missing.append("the NVIDIA CUDA Toolkit 13.0")
+        missing.append("the NVIDIA " + need_cuda_text)
     if not missing:
         ok(f"build tools present (CUDA {cuda_v[0]}.{cuda_v[1]})")
         return nvcc, vcvars
@@ -736,8 +740,6 @@ def main() -> int:
              "install the NVIDIA driver from https://www.nvidia.com/drivers and restart the PC")
     ok(f"GPU: {gpu['name']}, {gpu['vram_gb']:.1f} GB VRAM, compute capability {gpu['arch'][:-1]}.{gpu['arch'][-1]}, "
        f"driver {gpu['driver']}")
-    if int(gpu["arch"]) < 80:
-        fail("this GPU is older than the RTX 30 series (compute capability 8.0 is required)")
     if driver_major(gpu) < MIN_DRIVER:
         fail(f"the NVIDIA driver is too old ({gpu['driver']}; {MIN_DRIVER} or newer is needed)",
              "update it with the NVIDIA App or from https://www.nvidia.com/drivers, restart, and run this again")
@@ -756,6 +758,8 @@ def main() -> int:
     ok(f"CPU: {cpu} ({'AVX-512' if avx512 else 'AVX2' if avx2 else 'no AVX2'})")
     if not avx2:
         fail("this CPU has no AVX2; Strata needs at least AVX2")
+    if not avx512:
+        warn("the Q2_0 pack needs AVX512-VNNI/VBMI; choose IQ2_XS on an AVX2-only CPU")
     if a.check:
         say()
         for m, d in MODELS.items():
@@ -786,11 +790,17 @@ def main() -> int:
         d = MODELS[m]
         fit = "" if ram >= d["ram_gb"] else f"   <- needs {d['ram_gb']} GB RAM, you have {ram:.0f}"
         say(f"  {i}) {m:8s} {d['about']}; download {d['download_gb']:.0f} GB, uses ~{d['arena_gb']:.0f} GB of RAM{fit}")
-    rec = str(names.index("IQ3_XXS") + 1) if ram >= 60 else "1"
+    preferred = "IQ3_XXS" if ram >= 60 else ("Q2_0" if avx512 else "IQ2_XS")
+    if preferred not in names:
+        preferred = names[0]
+    rec = str(names.index(preferred) + 1)
     model = a.model or names[int(ask("Which size?", [str(i) for i in range(1, len(names) + 1)], rec, a.yes)) - 1]
     if ram < MODELS[model]["ram_gb"] - 4:
         fail(f"{model} needs about {MODELS[model]['ram_gb']} GB of RAM; this PC has {ram:.0f} GB",
              "choose Q2_0 or IQ2_XS, or add RAM")
+    if model == "Q2_0" and not avx512:
+        fail("the Q2_0 expert kernel needs AVX512-VNNI and AVX512-VBMI",
+             "choose IQ2_XS, whose native expert path supports AVX2 CPUs")
     ok(f"size: {model}")
     tag = fam["tag"] + model                           # names of the pack, config and start script
     rec_ctx = 32768 if gpu["vram_gb"] < 14 else 65536 if gpu["vram_gb"] < 20 else 131072

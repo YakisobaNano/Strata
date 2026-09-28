@@ -28,7 +28,9 @@
 namespace strata::kernels {
 namespace {
 std::atomic<bool> enabled{false};
-constexpr int D=128, HEADS=4, R=4, ROWS=32, WARPS=2, STRIDE=36, COMBINE=68;
+constexpr int D=128, HEADS=4, R=4, ROWS=32, WARPS=2;
+#if !defined(__CUDA_ARCH__) || __CUDA_ARCH__ >= 800
+constexpr int STRIDE=36, COMBINE=68;
 struct TileA { uint32_t x[4]; };
 struct TileB { uint32_t x[2]; };
 struct TileC { float x[4]={0.0f,0.0f,0.0f,0.0f}; };
@@ -48,10 +50,60 @@ __device__ __forceinline__ void mma(TileC& c,const TileA& a,const TileB& b) {
         : "+f"(c.x[0]),"+f"(c.x[1]),"+f"(c.x[2]),"+f"(c.x[3])
         : "r"(a.x[0]),"r"(a.x[1]),"r"(a.x[2]),"r"(a.x[3]),"r"(b.x[0]),"r"(b.x[1]));
 }
+#endif
+
+// Volta has no ldmatrix or TF32 MMA. Keep the same row/cell and head-bias contract using
+// ordinary FP32 CUDA-core FMA and warp reductions. This path is intentionally selected at
+// compile time for sm_70; sm_80+ continues to use the pinned Tensor Core implementation below.
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+__device__ __forceinline__ void score_kernel_fp32(
+        const float* __restrict__ pooled,const float* __restrict__ query,
+        const float* __restrict__ bias,const int32_t* __restrict__ step,
+        int max_cells,float* __restrict__ cells) {
+    const int n=step[kStepNKv],full=step[kStepNBid];
+    if(n<1||n>max_cells||step[kStepPos]!=n-1||full!=n/R||
+       step[kStepWidth]!=(n<2051?n:2051))return;
+    const int row0=blockIdx.x*ROWS;
+    if(row0>full)return;
+    const int lane=threadIdx.x,warp=threadIdx.y;
+    __shared__ float head_sum[HEADS];
+    for(int ri=0;ri<ROWS;++ri){
+        const int row=row0+ri;
+        if(row<=full){
+            // Two warps each process two heads, so the existing 64-thread launch shape remains valid.
+            for(int pair=0;pair<2;++pair){
+                const int h=warp*2+pair;
+                float acc=0.0f;
+                for(int col=lane;col<D;col+=32)
+                    acc=__fmaf_rn(pooled[size_t(row)*D+col],query[h*D+col],acc);
+                for(int delta=16;delta>0;delta>>=1)
+                    acc=__fadd_rn(acc,__shfl_down_sync(0xffffffffu,acc,delta));
+                if(lane==0)head_sum[h]=acc;
+            }
+        }
+        __syncthreads();
+        if(row<=full&&warp==0&&lane==0){
+            float h[HEADS];
+#pragma unroll
+            for(int j=0;j<HEADS;++j)h[j]=fmaxf(head_sum[j],0.0f);
+            float sum=__fadd_rn(__fadd_rn(__fadd_rn(h[0],h[1]),h[2]),h[3]);
+            if(bias)sum=__fadd_rn(sum,bias[row]);
+            sum=__fadd_rn(sum,row==full&&n%R?1e9f:0.0f);
+            sum=__fadd_rn(sum,0.0f);
+            for(int i=row*R;i<n&&i<(row+1)*R;++i)cells[i]=sum;
+        }
+        __syncthreads();
+    }
+}
+#endif
+
 __global__ __launch_bounds__(64,1) void score_kernel(
         const float* __restrict__ pooled,const float* __restrict__ query,
         const float* __restrict__ bias,const int32_t* __restrict__ step,
         int max_cells,float* __restrict__ cells) {
+#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ < 800
+    score_kernel_fp32(pooled,query,bias,step,max_cells,cells);
+#else
     const int n=step[kStepNKv],full=step[kStepNBid];
     if(n<1||n>max_cells||step[kStepPos]!=n-1||full!=n/R||
        step[kStepWidth]!=(n<2051?n:2051))return;
@@ -118,6 +170,7 @@ __global__ __launch_bounds__(64,1) void score_kernel(
         sum=__fadd_rn(sum,0.0f);
         for(int i=row*R;i<n&&i<(row+1)*R;++i)cells[i]=sum;
     }
+#endif
 }
 struct Span{const void* p;size_t n;};
 void validate(Span s){
