@@ -219,3 +219,8 @@ Strata is open source under the [MIT License](LICENSE). A few parts carry their 
 (MIT, llama.cpp / ggml), the web app's font (SIL Open Font License 1.1) and the experimental speed projection's
 vector in `data/experimental-speed-projection` (Qwen Community License 1.0, from the model's activations). The
 models are not part of this repository; each model's own license applies to its files.
+
+### Tesla V100 (Volta) port
+
+Tesla V100 (`sm_70`) is supported with CUDA 12.x and the existing pre-sm80 portable kernels.
+See [the V100 build and correctness notes](docs/V100.md). CUDA 12.8 was tested on a V100 PCIe 32GB.

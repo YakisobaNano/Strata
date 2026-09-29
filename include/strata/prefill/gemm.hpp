@@ -51,6 +51,7 @@ private:
     int64_t scratch_elems_ = 0;
     void* workspace_ = nullptr;
     bool external_ = false;
+    bool bf16_fp32_fallback_ = false;
     void* hipblaslt_state_ = nullptr;
 };
 

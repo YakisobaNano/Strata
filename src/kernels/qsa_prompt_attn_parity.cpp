@@ -112,12 +112,25 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16
             k::qsa_decode_attn_batch(d_q + t0 * NH * HD, pl, d_ids + t0 * cap, d_steps + t0 * k::kStepCount, cap, s,
                                      scratch, d_old + t0 * NH * HD, std::min(batch, nq - t0), nullptr);
     };
+    int device = 0;
+    cudaDeviceProp prop{};
+    ck(cudaGetDevice(&device), "device");
+    ck(cudaGetDeviceProperties(&prop, device), "properties");
     auto new_run = [&]() {
         if (!k::qsa_prompt_attn_batch(d_q, pl, d_ids, d_steps, cap, s, d_new, nq, nullptr)) {
-            std::fprintf(stderr, "qsa_prompt_attn_batch refused the pools\n");
-            std::exit(2);
+            if (prop.major >= 8) {
+                std::fprintf(stderr, "qsa_prompt_attn_batch unexpectedly refused the pools\n");
+                std::exit(2);
+            }
+            // Execute the production pre-sm80 fallback and check it against FP64 below.
+            for (int64_t t0 = 0; t0 < nq; t0 += batch)
+                k::qsa_decode_attn_batch(d_q + t0 * NH * HD, pl, d_ids + t0 * cap,
+                    d_steps + t0 * k::kStepCount, cap, s, scratch,
+                    d_new + t0 * NH * HD, std::min(batch, nq - t0), nullptr);
         }
     };
+    std::printf("attention dispatch sm_%d%d: %s\n", prop.major, prop.minor,
+        prop.major < 8 ? "portable pre-sm80" : "tensor cores");
     old_run();
     new_run();
     ck(cudaDeviceSynchronize(), "run");
@@ -163,6 +176,7 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16
     // 2. new vs old everywhere
     double diff = 0, scale = 0;
     for (size_t i = 0; i < o.size(); ++i) {
+        if (!std::isfinite(o[i]) || !std::isfinite(nw[i])) { std::fprintf(stderr, "non-finite attention\n"); return 1; }
         diff = std::max(diff, (double) std::fabs(o[i] - nw[i]));
         scale = std::max(scale, (double) std::fabs(o[i]));
     }
@@ -181,7 +195,8 @@ int run(int fmt, int64_t ctx, int64_t nq, int reps) {   // fmt 1 int8, 0 fp16
     cudaEventRecord(e1);
     ck(cudaEventSynchronize(e1), "time");
     cudaEventElapsedTime(&ms_new, e0, e1);
-    const bool ok1 = err_new <= std::max(4.0 * err_old, 1e-6 * ref_scale);
+    const bool reference_ok = err_old <= 2e-5 * std::max(1.0, ref_scale);
+    const bool ok1 = reference_ok && err_new <= std::max(4.0 * err_old, 1e-6 * ref_scale);
     const bool ok2 = diff <= 1e-4 * scale;
     std::printf("%s %s ctx %lld, %lld queries: vs FP64 old %.3g new %.3g (output scale %.3g); new vs old %.3g (%.2g of "
                 "scale); %.3f -> %.3f ms per chunk (%.2fx)\n",

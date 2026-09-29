@@ -327,7 +327,20 @@ int main() {
     // against the SAME dequant reference, output un-rotated exactly as prefill.cpp does.
     {
         float* d_at4 = dalloc<float>((size_t) QH * D);
-        const bool took = k::qsa_prompt_attn_batch(d_q, pools, d_ids, d_step, cells, s, d_at4, 1, nullptr);
+        bool took = k::qsa_prompt_attn_batch(d_q, pools, d_ids, d_step, cells, s, d_at4, 1, nullptr);
+#if !defined(STRATA_USE_HIP)
+        if (!took) {
+            int device = 0;
+            cudaDeviceProp prop{};
+            ck(cudaGetDevice(&device), "device");
+            ck(cudaGetDeviceProperties(&prop, device), "properties");
+            if (prop.major < 8) {
+                k::qsa_decode_attn_batch(d_q, pools, d_ids, d_step, cells, s, d_scr, d_at4, 1, nullptr);
+                took = true;
+                std::printf("[5/5] pre-sm80 prompt attention: portable fallback executed\n");
+            }
+        }
+#endif
         if (!took) {
 #if defined(STRATA_USE_HIP)
             // AMD: the tensor-core prompt path is CUDA-only, so it refuses every pool and the old kernel runs
@@ -345,7 +358,7 @@ int main() {
             for (size_t i = 0; i < h_at4.size(); ++i)
                 max_p = std::max(max_p, (double) std::fabs(h_at4[i] - ref_deq[i]));
             const bool pok = max_p < 1e-2;
-            std::printf("[5/5] qsa_prompt_attn mode 3 (tensor cores): %s (vs dequant ref %.2e)\n",
+            std::printf("[5/5] qsa_prompt_attn mode 3 (selected production path): %s (vs dequant ref %.2e)\n",
                         pok ? "PASS" : "FAIL", max_p);
             if (!pok) g_fail = 1;
         }

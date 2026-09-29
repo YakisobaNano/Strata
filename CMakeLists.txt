@@ -4,9 +4,8 @@
 # `strata-pack` are added when their sources exist - a target with no sources would make the build graph
 # claim something the tree does not have, which is worse than an absent target.
 #
-# CUDA targets arrive in Phase 2.  The kernels need sm_80 or newer (tf32 mma, bf16 math) and the guard
-# below refuses anything older: silently building for a pre-Ampere arch would produce a binary that runs
-# and is wrong about its own performance, which is the worst of both outcomes.
+# CUDA targets support sm_70 and newer. Pre-sm80 devices use the existing portable QSA paths.
+# Volta offline compilation requires CUDA 12.x.
 cmake_minimum_required(VERSION 3.24)
 project(strata VERSION 0.1.27 LANGUAGES CXX)
 add_compile_definitions(STRATA_VERSION="${PROJECT_VERSION}")
@@ -64,13 +63,16 @@ if(STRATA_ENABLE_CUDA)
     string(REGEX REPLACE "-.*$" "" _base "${_a}")     # 120-real / 120-virtual are still 120
     # Turing port: developed and measured on sm_120 (RTX 50); the tf32 mma in the QSA scorer has a
     # portable fp32-FMA fallback, so RTX 20 (75), 30 (86), RTX 40 (89) and RTX 50 (120) build too.
-    # Pre-sm_75 is refused.
+    # Volta shares these portable paths; CUDA 13 cannot compile sm_70.
     if(_base STREQUAL "native" OR _base STREQUAL "all" OR _base STREQUAL "all-major")
       continue()
     endif()
-    if(_base LESS 75)
+    if(_base LESS 75 AND CMAKE_CUDA_COMPILER_VERSION VERSION_GREATER_EQUAL 13)
+      message(FATAL_ERROR "sm_70 requires CUDA 12.x; use -DCMAKE_CUDA_COMPILER=/usr/local/cuda-12.8/bin/nvcc")
+    endif()
+    if(_base LESS 70)
       message(FATAL_ERROR
-        "Strata needs an NVIDIA GPU of compute capability 7.5 or newer (RTX 20 / 30 / 40 / 50 series), but "
+        "Strata needs an NVIDIA GPU of compute capability 7.0 or newer (Tesla V100 / RTX 20 or newer), but "
         "CMAKE_CUDA_ARCHITECTURES is '${CMAKE_CUDA_ARCHITECTURES}'.")
     endif()
   endforeach()
@@ -174,6 +176,8 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
   else()
     message(STATUS "strata: pack/full/experts.bin absent - the expert arena load test is NOT registered")
   endif()
+
+  enable_testing()
 
   # ---- strata_kernels (P2.S2) ----
   # Naive first, each with a parity test against a reference that was itself validated against ggml.  The
@@ -313,6 +317,17 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
 
     add_executable(tune_hipblaslt tools/hip/tune_hipblaslt.cpp)
     target_link_libraries(tune_hipblaslt PRIVATE hip::host roc::hipblas roc::hipblaslt)
+  endif()
+
+  option(STRATA_V100_PARITY "Build standalone pre-sm80 correctness checks" OFF)
+  if(STRATA_ENABLE_CUDA AND STRATA_V100_PARITY)
+    add_executable(native_qsa_score_portable_parity src/kernels/native_qsa_score_parity.cpp)
+    target_link_libraries(native_qsa_score_portable_parity PRIVATE strata_kernels CUDA::cudart)
+    target_include_directories(native_qsa_score_portable_parity PRIVATE ${_strata_gpu_include_directories})
+    add_test(NAME native_qsa_score_portable_parity COMMAND native_qsa_score_portable_parity --selftest)
+    add_executable(bf16_gemm_parity src/prefill/gemm_parity.cpp)
+    target_link_libraries(bf16_gemm_parity PRIVATE strata_prefill CUDA::cudart)
+    add_test(NAME bf16_gemm_parity COMMAND bf16_gemm_parity --selftest)
   endif()
 
   add_executable(strata src/program/generate.cpp)
