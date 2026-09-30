@@ -5,6 +5,7 @@
 // MIT license, third_party/ggml/LICENSE).  The block structs and codebook grids come from its ggml-common.h,
 // included unchanged.
 #include "strata/kernels/iq_kernels.hpp"
+#include "strata/kernels/iq2s_volta.hpp"
 
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
@@ -38,23 +39,6 @@ __device__ __forceinline__ uint32_t unpack_ksigns(const uint8_t v) {
     return s * 0x01010101;
 }
 
-// Volta implements __vcmpne4/__vsub4 through multi-instruction emulation. IQ2_S uses those operations only
-// to conditionally negate four non-zero codebook bytes before DP4A. On sm_70, expand the four sign bits with
-// ordinary integer arithmetic and perform the bytewise two's-complement negation as one 32-bit XOR+add.
-// iq2s_grid's bytes are 0x08/0x19/0x2b, so (~byte)+1 never carries into the neighboring byte. Keep the
-// original CUDA byte-SIMD path everywhere else; this is deliberately a V100-only performance hypothesis.
-__device__ __forceinline__ uint32_t v100_iq2s_sign_mask4(uint8_t bits) {
-    const uint32_t b0 = 0u - (uint32_t) ( bits       & 1u);
-    const uint32_t b1 = 0u - (uint32_t) ((bits >> 1) & 1u);
-    const uint32_t b2 = 0u - (uint32_t) ((bits >> 2) & 1u);
-    const uint32_t b3 = 0u - (uint32_t) ((bits >> 3) & 1u);
-    return (b0 & 0x000000ffu) | (b1 & 0x0000ff00u) |
-           (b2 & 0x00ff0000u) | (b3 & 0xff000000u);
-}
-__device__ __forceinline__ int v100_iq2s_apply_signs(int packed_grid, uint8_t bits) {
-    const uint32_t mask = v100_iq2s_sign_mask4(bits);
-    return (int) (((uint32_t) packed_grid ^ mask) + (mask & 0x01010101u));
-}
 __device__ __forceinline__ int2 get_int_from_table_16(const int& q4, const int8_t* table) {
     const uint32_t* table32 = (const uint32_t*) table;
     uint32_t tmp[2];
@@ -167,8 +151,8 @@ __device__ __forceinline__ float vec_dot_iq2_s_q8_1(const void* __restrict__ vbq
         const int* grid_pos = (const int*) (iq2s_grid + (qs[l0 / 2] | ((qh << (8 - l0)) & 0x300)));
 #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 700
         const uint8_t sign_bits = signs_packed_8[l0 / 2];
-        const int grid_l = v100_iq2s_apply_signs(grid_pos[0], sign_bits);
-        const int grid_h = v100_iq2s_apply_signs(grid_pos[1], sign_bits >> 4);
+        const int grid_l = (int) detail::iq2s_apply_signs((uint32_t) grid_pos[0], sign_bits);
+        const int grid_h = (int) detail::iq2s_apply_signs((uint32_t) grid_pos[1], sign_bits >> 4);
 #else
         const int signs0 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x03) << 7) | ((signs_packed_8[l0 / 2] & 0x0C) << 21), 0x00000000);
         const int signs1 = __vcmpne4(((signs_packed_8[l0 / 2] & 0x30) << 3) | ((signs_packed_8[l0 / 2] & 0xC0) << 17), 0x00000000);
